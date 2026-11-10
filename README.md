@@ -3,7 +3,6 @@
 > 🇨🇳 [中文说明](README_zh-CN.md)
 
 **The free & open-source Wispr Flow alternative** — fully offline push-to-talk dictation for Windows. Hold a hotkey, speak,
-n> 🇨🇳 [中文说明](README_zh-CN.md)
 release — the text is typed into whatever your cursor is in. No cloud, no lag, no
 subscription.
 

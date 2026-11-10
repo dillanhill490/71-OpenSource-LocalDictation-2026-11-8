@@ -1,0 +1,5 @@
+sherpa-onnx>=1.10
+numpy
+sounddevice
+pystray
+pillow

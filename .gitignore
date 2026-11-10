@@ -1,0 +1,4 @@
+models/
+dictation.log
+replacements.json
+__pycache__/

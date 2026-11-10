@@ -10,21 +10,24 @@ subscription.
 
 ## Why I built this
 
-I was a paying user of a popular cloud dictation tool (Wispr Flow, $20/month).
-Three pain points made me quit it:
+First, a tribute: I'm a paying Pro user of [Wispr Flow](https://wisprflow.ai), and
+it's a wonderful product — it made hold-to-talk dictation mainstream, and this
+project openly borrows its interaction design. All credit to the team.
 
-1. **Lag.** Your voice travels to a remote server and back — every hiccup in your
-   network stalls the text.
-2. **Privacy.** Everything you dictate is uploaded to someone else's cloud.
-3. **Cost.** $20 every month, forever.
+That said, I wanted three things a cloud tool by design cannot give me:
 
-LocalDictation fixes all three:
+1. **Latency** — cloud round-trips stall whenever the network does.
+2. **Privacy** — every dictated word is uploaded to a third-party cloud.
+3. **Subscription** — Pro runs $15/month ($12 billed annually), indefinitely.
 
-| | Cloud dictation | **LocalDictation** |
+So I built LocalDictation as a local-first homage: same hold-to-talk flow,
+everything on your machine.
+
+| | Cloud dictation (Wispr Flow Pro) | **LocalDictation** |
 |---|---|---|
 | Latency | network-dependent | **~0.1 s decode, pure CPU** |
 | Voice data | uploaded to cloud | **never leaves your machine** |
-| Cost | $20/month | **$0** |
+| Cost | $15/mo ($12 annual) | **$0** |
 | Disk | — | **~320 MB** (model + runtime) |
 
 ## Features
@@ -40,7 +43,7 @@ LocalDictation fixes all three:
 - Tray icon with pause/exit; optional start-up shortcut
 - English/Japanese/Korean/Cantonese also recognized (auto language detection)
 
-## Install (Windows 10/11)
+## Install (Windows 10/11 — macOS version in active development)
 
 ```bat
 git clone https://github.com/dillanhill490/71-OpenSource-LocalDictation-2026-11-8.git
@@ -74,7 +77,10 @@ folder (`Win+R` → `shell:startup`).
 
 ## Roadmap
 
-- [ ] macOS port (typing injection, hotkey and overlay need native rewrites — PRs welcome)
+- [ ] **macOS support — planned and on the roadmap.** The ASR core (SenseVoice +
+      sherpa-onnx) is already cross-platform; typing injection, hotkey capture and
+      the overlay need native rewrites. This project is intended to be
+      cross-platform, not Windows-only.
 - [ ] Clipboard-paste fallback for elevated/sandboxed windows
 - [ ] Curated Chinese developer hotword pack
 

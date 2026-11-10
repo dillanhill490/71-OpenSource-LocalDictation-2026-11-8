@@ -1,5 +1,6 @@
 # LocalDictation（本地听写）
 
+
 **免费、完全离线的 Windows 按住说话工具。** 按住快捷键说话，松开，文字直接打进光标所在输入框。不连云、不卡顿、零订阅。
 
 ![浮窗](assets/pill_hero.png)

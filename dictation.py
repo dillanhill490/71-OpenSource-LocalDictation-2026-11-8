@@ -11,6 +11,7 @@ import ctypes
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -34,13 +35,39 @@ RMS_GATE = 0.002
 TYPE_INTERVAL_S = 0.003
 MIN_DUR_S = 0.25
 REPL_PATH = os.path.join(ROOT, "replacements.json")   # 专有名词替换表（用户可编辑，每次听写自动重载）
+LLM_PATH = os.path.join(ROOT, "models", "llm", "qwen2.5-3b-instruct-q4_k_m.gguf")  # 本地润色模型
+LLAMA_SERVER_EXE = os.path.join(ROOT, "llama-cpp", "llama-server.exe")
+LLAMA_PORT = 8750
+LLAMA_BASE = f"http://127.0.0.1:{LLAMA_PORT}"
 DEFAULT_REPL = {
     "get up": "GitHub",
     "get hub": "GitHub",
     "github": "GitHub",
     "mac": "Mac",
+    "macbook": "MacBook",
     "vs code": "VSCode",
     "vscode": "VSCode",
+    "api": "API",
+    "ui": "UI",
+    "ux": "UX",
+    "cpu": "CPU",
+    "gpu": "GPU",
+    "llm": "LLM",
+    "ai": "AI",
+    "chat gpt": "ChatGPT",
+    "chatgpt": "ChatGPT",
+    "claude": "Claude",
+    "cursor": "Cursor",
+    "grok": "Grok",
+    "open ai": "OpenAI",
+    "openai": "OpenAI",
+    "python": "Python",
+    "docker": "Docker",
+    "linux": "Linux",
+    "wispr": "Wispr",
+    "wispr flow": "Wispr Flow",
+    "local dictation": "LocalDictation",
+    "qq": "QQ",
 }
 
 
@@ -68,7 +95,105 @@ def apply_replacements(text):
             text = text.replace(k, v)
     return text
 
-state = {"enabled": True, "recording": False, "rec_start": 0.0, "rec_gen": 0}
+
+# ---------------- 本地小模型润色层（Phase 2，llama-server GPU 推理 + HTTP 调用） ----------------
+_llm_proc = {"popen": None}
+POLISH_SYS = ("你是语音输入润色器。把语音识别原文改写为通顺书面文字：只修正错别字、"
+              "专有名词写法、删除口头语（嗯、呃、那个、就是说）、规范标点；"
+              "不得改变意思、不得增删内容、不要回答或评论原文。直接输出改写结果，不要任何解释。")
+POLISH_FEWSHOT = [
+    ("帮我打开get up写个爬虫", "帮我打开 GitHub 写个爬虫"),
+    ("那个今天下午三点开会 呃 别迟到", "今天下午三点开会，别迟到。"),
+    ("把这个bug修一下嗯然后重新发布", "把这个 bug 修一下，然后重新发布。"),
+]
+
+
+def _port_alive():
+    import urllib.request
+    try:
+        with urllib.request.urlopen(LLAMA_BASE + "/health", timeout=1) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def get_llm():
+    """确保 llama-server（GPU）已启动且健康；失败只降级一次并留日志，之后直接跳过润色。"""
+    if _llm_proc["popen"] is not None:
+        if _port_alive():
+            return True
+        log("润色服务失联，尝试重启……")
+        try:
+            _llm_proc["popen"].kill()
+        except Exception:
+            pass
+        _llm_proc["popen"] = None
+    if not os.path.exists(LLAMA_SERVER_EXE):
+        log(f"润色层：未找到 {LLAMA_SERVER_EXE}，润色关闭")
+        _llm_proc["popen"] = -1   # 标记永久不可用
+        return None
+    if not os.path.exists(LLM_PATH):
+        log(f"润色层：未找到模型 {LLM_PATH}，润色关闭")
+        _llm_proc["popen"] = -1
+        return None
+    try:
+        flags = 0x08000000   # CREATE_NO_WINDOW
+        p = subprocess.Popen(
+            [LLAMA_SERVER_EXE, "-m", LLM_PATH, "-ngl", "99", "-c", "2048",
+             "--port", str(LLAMA_PORT), "--threads", "8"],
+            creationflags=flags,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        for _ in range(60):           # 最长等 30 秒加载模型
+            time.sleep(0.5)
+            if _port_alive():
+                _llm_proc["popen"] = p
+                log(f"润色服务已启动（GPU，PID={p.pid}）")
+                return True
+            if p.poll() is not None:
+                break
+        log("润色服务启动超时/退出，润色关闭")
+        _llm_proc["popen"] = -1
+        return None
+    except Exception as e:
+        log(f"润色服务启动失败，已停用：{type(e).__name__}: {e}")
+        _llm_proc["popen"] = -1
+        return None
+
+
+def polish_text(text):
+    if not state.get("polish", True) or len(text) < 2:
+        return text
+    llm = get_llm()
+    if not llm:
+        return text
+    try:
+        import urllib.request
+        prompt = POLISH_SYS + "\n\n"
+        for a, b in POLISH_FEWSHOT:
+            prompt += f"原文：{a}\n改写：{b}\n\n"
+        prompt += f"原文：{text}\n改写："
+        body = json.dumps({"prompt": prompt,
+                           "n_predict": min(160, len(text) * 3 + 32),
+                           "temperature": 0.1,
+                           "stop": ["\n原文：", "\n\n", "原文："]}).encode("utf-8")
+        req = urllib.request.Request(LLAMA_BASE + "/completion", data=body,
+                                     headers={"Content-Type": "application/json"})
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=30) as r:
+            fixed = json.loads(r.read().decode("utf-8"))["content"].strip().strip('"')
+        ms = (time.time() - t0) * 1000
+        # 守护：空/异常长/疑似回答原文 → 回退不改写
+        if not fixed or len(fixed) > len(text) * 3 + 20:
+            log(f"润色输出异常，回退原文（{ms:.0f}ms）：{fixed!r}")
+            return text
+        log(f"润色 {ms:.0f}ms：{text!r} → {fixed!r}")
+        return fixed
+    except Exception as e:
+        log(f"润色出错，回退原文：{type(e).__name__}: {e}")
+        return text
+
+state = {"enabled": True, "recording": False, "rec_start": 0.0, "rec_gen": 0, "polish": True}
 frames = []
 levels = deque(maxlen=75)   # 20ms/块 → 1.5s 波形历史
 icon_ref = {}
@@ -141,9 +266,33 @@ VK_CTRL, VK_SPACE = 0x11, 0x20
 
 
 def hotkey_poll_thread(rec):
+    """Ctrl+Space 全局占用（RegisterHotKey）+ 物理轮询判定按住/松开。
+    注册后该组合键被系统截住不再传给输入法——根治"说完话中英输入法被切换"
+    （Wispr 同款行为）。暂停听写时自动注销，把组合键还给系统。"""
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    import ctypes.wintypes as wt
+    WM_HOTKEY, MOD_CONTROL, ID = 0x0312, 0x0002, 1
+    registered = False
     was_down = False
+    msg = wt.MSG()
     while True:
         try:
+            want = state["enabled"]
+            if want and not registered:
+                registered = bool(user32.RegisterHotKey(None, ID, MOD_CONTROL, VK_SPACE))
+                if registered:
+                    log("已注册并接管 Ctrl+Space（该组合键不再触达输入法，中英切换不会被误触）")
+                else:
+                    log(f"注册 Ctrl+Space 失败（GetLastError={kernel32.GetLastError()}），"
+                        f"可能被其他程序占用：退回纯轮询模式，输入法切换不受影响")
+            elif not want and registered:
+                user32.UnregisterHotKey(None, ID)
+                registered = False
+                log("已注销 Ctrl+Space 占用（暂停听写：组合键还给系统）")
+            if registered:
+                while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                    pass   # 取走 WM_HOTKEY 即可（按下时序判定仍由下面的物理轮询负责）
             ctrl = bool(GetAsyncKeyState(VK_CTRL) & 0x8000)
             space = bool(GetAsyncKeyState(VK_SPACE) & 0x8000)
             down = ctrl and space and state["enabled"]
@@ -160,7 +309,9 @@ def hotkey_poll_thread(rec):
 # ---------------- 识别与上屏 ----------------
 def finish_recording(rec):
     audio = np.concatenate(frames).reshape(-1) if frames else np.zeros(0, dtype="float32")
-    icon_ref["icon"].icon = ICON_IDLE
+    ic = icon_ref.get("icon")
+    if ic:
+        ic.icon = ICON_IDLE
     dur = len(audio) / SR
     if dur < MIN_DUR_S:
         notify("按压太短（<0.25s），未录音")
@@ -180,8 +331,9 @@ def finish_recording(rec):
             notify("识别结果为空，未上屏")
             return
         fixed = apply_replacements(text)
+        fixed = polish_text(fixed)
         type_text(fixed)
-        log(f"{dur:.1f}s 音频 解码{ms:.0f}ms：{text}" + (f"（替换为：{fixed}）" if fixed != text else ""))
+        log(f"{dur:.1f}s 音频 解码{ms:.0f}ms：{text}" + (f"（上屏：{fixed}）" if fixed != text else ""))
     except Exception as e:
         notify(f"出错了：{type(e).__name__}：{e}")
 
@@ -192,7 +344,9 @@ def start_rec():
     state["rec_start"] = time.time()
     frames.clear()
     levels.clear()
-    icon_ref["icon"].icon = ICON_REC
+    ic = icon_ref.get("icon")   # 启动头几秒托盘未就绪时按键不报错
+    if ic:
+        ic.icon = ICON_REC
 
 
 def stop_rec(rec):
@@ -459,14 +613,26 @@ def main():
             icon.icon = ICON_IDLE if state["enabled"] else ICON_OFF
             notify("已恢复 Ctrl+Space 听写" if state["enabled"] else "已暂停：Ctrl+Space 恢复自由")
 
+        def toggle_polish(icon, item):
+            state["polish"] = not state.get("polish", True)
+            notify(f"润色层：{'开（本地小模型纠错润色）' if state['polish'] else '关（原文直出）'}")
+
         menu = Menu(
             MenuItem(lambda item: "暂停听写（释放 Ctrl+Space）" if state["enabled"]
                      else "恢复听写", toggle),
+            MenuItem(lambda item: "润色后上屏：开" if state.get("polish", True)
+                     else "润色后上屏：关", toggle_polish),
             MenuItem("退出", lambda icon: icon.stop()),
         )
         icon = pystray.Icon("LocalDictation", ICON_IDLE, "本地听写：按住 Ctrl+Space 说话", menu)
         icon_ref["icon"] = icon
         icon.run()
+    _p = _llm_proc.get("popen")
+    if _p:   # 退出程序即释放润色服务占用的显存
+        try:
+            _p.terminate()
+        except Exception:
+            pass
     log("已退出")
 
 

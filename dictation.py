@@ -39,6 +39,7 @@ LLM_PATH = os.path.join(ROOT, "models", "llm", "qwen2.5-3b-instruct-q4_k_m.gguf"
 LLAMA_SERVER_EXE = os.path.join(ROOT, "llama-cpp", "llama-server.exe")
 LLAMA_PORT = 8750
 LLAMA_BASE = f"http://127.0.0.1:{LLAMA_PORT}"
+SETTINGS_PATH = os.path.join(ROOT, "settings.json")   # 记住可用人声的麦克风设备
 DEFAULT_REPL = {
     "get up": "GitHub",
     "get hub": "GitHub",
@@ -197,6 +198,7 @@ state = {"enabled": True, "recording": False, "rec_start": 0.0, "rec_gen": 0, "p
 frames = []
 levels = deque(maxlen=75)   # 20ms/块 → 1.5s 波形历史
 icon_ref = {}
+stream_health = {"last_cb": time.time(), "stream": None}   # 录音流心跳（僵死自动重开）
 
 
 def log(msg):
@@ -313,13 +315,34 @@ def finish_recording(rec):
     if ic:
         ic.icon = ICON_IDLE
     dur = len(audio) / SR
+    rms = float(np.sqrt(np.mean(audio ** 2)))
     if dur < MIN_DUR_S:
         notify("按压太短（<0.25s），未录音")
         return
-    rms = float(np.sqrt(np.mean(audio ** 2)))
     if rms < RMS_GATE:
-        notify("未检测到语音（音量过低），未上屏")
+        if dur >= 1.0 and not state.get("scanning"):
+            state["scanning"] = True
+            log(f"按住 {dur:.1f}s 全程静音（RMS={rms:.4f}）→ 启动麦克风自动检测")
+            notify("麦克风没有听到声音：请对着电脑持续说话约 10 秒，正在自动检测……")
+            try:
+                auto_pick_and_switch()
+            finally:
+                state["scanning"] = False
+        else:
+            notify("未检测到语音（音量过低），未上屏")
         return
+    # 成功听写：记住这台真能听到用户的麦克风（跨重启持久）
+    s_cur = stream_health.get("stream")
+    if s_cur:
+        try:
+            dev = s_cur.device
+            st = load_settings()
+            if st.get("device_index") != dev:
+                st["device_index"] = dev
+                st["device_name"] = sd.query_devices(dev)["name"]
+                save_settings(st)
+        except Exception:
+            pass
     try:
         t0 = time.time()
         s = rec.create_stream()
@@ -355,9 +378,125 @@ def stop_rec(rec):
 
 
 def audio_callback(indata, _n, _t, _st):
+    stream_health["last_cb"] = time.time()   # 心跳：回调持续到达=流健康
     if state["recording"]:
         frames.append(indata[:, 0].copy())
         levels.append(float(np.sqrt(np.mean(indata ** 2))))
+
+
+def reopen_stream(device=None):
+    """重开录音流（设备变更/驱动休眠后旧流会僵尸）。优先用记住的可用麦克风；
+    记住的设备失效时自动回退系统默认。"""
+    if device is None:
+        device = load_settings().get("device_index")
+    s = stream_health.get("stream")
+    if s:
+        try:
+            s.stop()
+            s.close()
+        except Exception:
+            pass
+    kwargs = dict(samplerate=SR, channels=1, dtype="float32",
+                  blocksize=320, callback=audio_callback)
+    if device is not None:
+        kwargs["device"] = device
+    try:
+        s2 = sd.InputStream(**kwargs)
+    except Exception:
+        if device is None:
+            raise
+        kwargs.pop("device")
+        s2 = sd.InputStream(**kwargs)
+    s2.start()
+    stream_health["stream"] = s2
+    stream_health["last_cb"] = time.time()
+    return s2
+
+
+def audio_watchdog_thread():
+    """每 3 秒检查录音流心跳，>5 秒无回调自动重开（自愈），事件写日志。"""
+    while True:
+        time.sleep(3)
+        try:
+            if stream_health.get("stream") is None:
+                continue
+            idle = time.time() - stream_health["last_cb"]
+            if idle > 5:
+                log(f"录音流 {idle:.0f}s 无数据（设备可能已变更/驱动休眠），自动重开")
+                reopen_stream()
+                log("录音流已重开")
+        except Exception as e:
+            log(f"录音流看门狗异常：{type(e).__name__}: {e}")
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_settings(d):
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+def pick_best_device(total_seconds=12.0):
+    """逐台试录输入设备并挑实时响度最高者。检测期间请用户持续说话。"""
+    best = None
+    tried = set()
+    deadline = time.time() + total_seconds
+    while time.time() < deadline:
+        for i in range(len(sd.query_devices())):
+            if i in tried:
+                continue
+            tried.add(i)
+            q = sd.query_devices(i)
+            if q["max_input_channels"] < 1:
+                continue
+            frames = []
+            try:
+                s = sd.InputStream(samplerate=SR, channels=1, dtype="float32",
+                                   blocksize=320, device=i,
+                                   callback=lambda d, n, t, st: frames.append(d[:, 0].copy()))
+                s.start()
+                time.sleep(1.0)
+                s.stop()
+                s.close()
+            except Exception:
+                continue
+            if not frames:
+                continue
+            audio = np.concatenate(frames)
+            rms = float(np.sqrt(np.mean(audio ** 2)))
+            if best is None or rms > best[1]:
+                best = (i, rms, q["name"])
+            if best and best[1] > RMS_GATE:
+                return best
+    return best
+
+
+def auto_pick_and_switch():
+    """静音自检：逐台试麦，切到真能听到用户说话的设备；全部无声则给出排查指引。"""
+    if state["recording"]:
+        return
+    notify("正在自动检测麦克风，请对着电脑持续说话约 10 秒……")
+    best = pick_best_device(12.0)
+    if best and best[1] > RMS_GATE:
+        idx, rms, name = best
+        st = load_settings()
+        st["device_index"], st["device_name"] = idx, name
+        save_settings(st)
+        reopen_stream(device=idx)
+        notify(f"已切换到能听到你的麦克风：{name}")
+        log(f"麦克风自动切换 → [{idx}] {name} (RMS={rms:.4f})")
+    else:
+        notify("所有麦克风都没听到声音。请检查：①键盘麦克风静音键 ②系统设置-隐私-麦克风权限 ③新插 USB 麦克风的本机开关/旋钮")
+        log(f"麦克风自动检测：无可用人声设备（best={best}）")
 
 
 # ---------------- Wispr 风格声波浮窗（Win32 分层窗口 + 会话级内联重建） ----------------
@@ -606,27 +745,28 @@ def main():
     threading.Thread(target=hotkey_poll_thread, args=(rec,), daemon=True).start()
     threading.Thread(target=_overlay_thread, daemon=True).start()
 
-    with sd.InputStream(samplerate=SR, channels=1, dtype="float32",
-                        blocksize=320, callback=audio_callback):
-        def toggle(icon, item):
-            state["enabled"] = not state["enabled"]
-            icon.icon = ICON_IDLE if state["enabled"] else ICON_OFF
-            notify("已恢复 Ctrl+Space 听写" if state["enabled"] else "已暂停：Ctrl+Space 恢复自由")
+    reopen_stream()   # 优先用 settings.json 记住的可用麦克风，失效回退系统默认
+    threading.Thread(target=audio_watchdog_thread, daemon=True).start()
 
-        def toggle_polish(icon, item):
-            state["polish"] = not state.get("polish", True)
-            notify(f"润色层：{'开（本地小模型纠错润色）' if state['polish'] else '关（原文直出）'}")
+    def toggle(icon, item):
+        state["enabled"] = not state["enabled"]
+        icon.icon = ICON_IDLE if state["enabled"] else ICON_OFF
+        notify("已恢复 Ctrl+Space 听写" if state["enabled"] else "已暂停：Ctrl+Space 恢复自由")
 
-        menu = Menu(
-            MenuItem(lambda item: "暂停听写（释放 Ctrl+Space）" if state["enabled"]
-                     else "恢复听写", toggle),
-            MenuItem(lambda item: "润色后上屏：开" if state.get("polish", True)
-                     else "润色后上屏：关", toggle_polish),
-            MenuItem("退出", lambda icon: icon.stop()),
-        )
-        icon = pystray.Icon("LocalDictation", ICON_IDLE, "本地听写：按住 Ctrl+Space 说话", menu)
-        icon_ref["icon"] = icon
-        icon.run()
+    def toggle_polish(icon, item):
+        state["polish"] = not state.get("polish", True)
+        notify(f"润色层：{'开（本地小模型纠错润色）' if state['polish'] else '关（原文直出）'}")
+
+    menu = Menu(
+        MenuItem(lambda item: "暂停听写（释放 Ctrl+Space）" if state["enabled"]
+                 else "恢复听写", toggle),
+        MenuItem(lambda item: "润色后上屏：开" if state.get("polish", True)
+                 else "润色后上屏：关", toggle_polish),
+        MenuItem("退出", lambda icon: icon.stop()),
+    )
+    icon = pystray.Icon("LocalDictation", ICON_IDLE, "本地听写：按住 Ctrl+Space 说话", menu)
+    icon_ref["icon"] = icon
+    icon.run()
     _p = _llm_proc.get("popen")
     if _p:   # 退出程序即释放润色服务占用的显存
         try:

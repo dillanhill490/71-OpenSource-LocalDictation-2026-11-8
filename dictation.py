@@ -40,6 +40,7 @@ LLAMA_SERVER_EXE = os.path.join(ROOT, "llama-cpp", "llama-server.exe")
 LLAMA_PORT = 8750
 LLAMA_BASE = f"http://127.0.0.1:{LLAMA_PORT}"
 SETTINGS_PATH = os.path.join(ROOT, "settings.json")   # 记住可用人声的麦克风设备
+WHISPER_DIR = os.path.join(ROOT, "models", "whisper-turbo-ct2")   # 主力 ASR（GPU）
 DEFAULT_REPL = {
     "get up": "GitHub",
     "get hub": "GitHub",
@@ -170,7 +171,9 @@ def polish_text(text):
         return text
     try:
         import urllib.request
-        prompt = POLISH_SYS + "\n\n"
+        vocab = "；".join(f"{k}→{v}" for k, v in load_replacements()[:40])
+        prompt = (POLISH_SYS + "\n专有名词标准写法（发现原文包含以下写法或其同音误识时，必须改成右侧写法）："
+                  + vocab + "\n\n")
         for a, b in POLISH_FEWSHOT:
             prompt += f"原文：{a}\n改写：{b}\n\n"
         prompt += f"原文：{text}\n改写："
@@ -267,7 +270,7 @@ GetAsyncKeyState = ctypes.windll.user32.GetAsyncKeyState
 VK_CTRL, VK_SPACE = 0x11, 0x20
 
 
-def hotkey_poll_thread(rec):
+def hotkey_poll_thread(asr):
     """Ctrl+Space 全局占用（RegisterHotKey）+ 物理轮询判定按住/松开。
     注册后该组合键被系统截住不再传给输入法——根治"说完话中英输入法被切换"
     （Wispr 同款行为）。暂停听写时自动注销，把组合键还给系统。"""
@@ -301,7 +304,7 @@ def hotkey_poll_thread(rec):
             if down and not was_down and not state["recording"]:
                 start_rec()
             elif was_down and not down and state["recording"]:
-                stop_rec(rec)
+                stop_rec(asr)
             was_down = down
         except Exception as e:
             log(f"热键轮询异常：{type(e).__name__}: {e}")
@@ -309,7 +312,7 @@ def hotkey_poll_thread(rec):
 
 
 # ---------------- 识别与上屏 ----------------
-def finish_recording(rec):
+def finish_recording(asr):
     audio = np.concatenate(frames).reshape(-1) if frames else np.zeros(0, dtype="float32")
     ic = icon_ref.get("icon")
     if ic:
@@ -317,6 +320,7 @@ def finish_recording(rec):
     dur = len(audio) / SR
     rms = float(np.sqrt(np.mean(audio ** 2)))
     if dur < MIN_DUR_S:
+        log(f"录音丢弃：dur={dur:.2f}s frames={len(frames)}")
         notify("按压太短（<0.25s），未录音")
         return
     if rms < RMS_GATE:
@@ -345,10 +349,15 @@ def finish_recording(rec):
             pass
     try:
         t0 = time.time()
-        s = rec.create_stream()
-        s.accept_waveform(SR, audio)
-        rec.decode_stream(s)
-        text = s.result.text.strip()
+        if asr["engine"] == "whisper":
+            segments, _ = asr["whisper"].transcribe(
+                audio, beam_size=1, temperature=0.0, condition_on_previous_text=False)
+            text = "".join(s.text for s in segments).strip()
+        else:
+            s = asr["sensevoice"].create_stream()
+            s.accept_waveform(SR, audio)
+            asr["sensevoice"].decode_stream(s)
+            text = s.result.text.strip()
         ms = (time.time() - t0) * 1000
         if not text:
             notify("识别结果为空，未上屏")
@@ -372,9 +381,9 @@ def start_rec():
         ic.icon = ICON_REC
 
 
-def stop_rec(rec):
+def stop_rec(asr):
     state["recording"] = False
-    threading.Thread(target=finish_recording, args=(rec,), daemon=True).start()
+    threading.Thread(target=finish_recording, args=(asr,), daemon=True).start()
 
 
 def audio_callback(indata, _n, _t, _st):
@@ -739,10 +748,27 @@ def main():
     load_replacements()   # 启动即生成/校验替换表文件，方便用户直接编辑
     rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
         model=MODEL, tokens=TOKENS, use_itn=True, num_threads=4, language="auto",
-    )
+    )   # 备用引擎（CPU），Whisper 不可用时自动接管
+    asr = {"engine": "sensevoice", "sensevoice": rec, "whisper": None}
+
+    if os.path.isdir(WHISPER_DIR):
+        try:
+            _sp = os.path.join(os.path.dirname(sys.executable), "Lib", "site-packages")
+            for _sub in (r"nvidia\cudnn\bin", r"nvidia\cublas\bin", r"nvidia\cuda_runtime\bin"):
+                _p = os.path.join(_sp, _sub)
+                if os.path.isdir(_p):
+                    os.add_dll_directory(_p)
+            from faster_whisper import WhisperModel
+            asr["whisper"] = WhisperModel(WHISPER_DIR, device="cuda", compute_type="float16")
+            asr["engine"] = "whisper"
+            log("ASR 引擎：Whisper large-v3-turbo（GPU 常驻；SenseVoice 自动备用）")
+        except Exception as e:
+            log(f"Whisper 引擎加载失败，回退 SenseVoice：{type(e).__name__}: {e}")
+    else:
+        log("未找到 Whisper 模型目录，使用 SenseVoice（CPU）")
     log("识别器就绪，托盘常驻中（按住 Ctrl+Space 说话）")
 
-    threading.Thread(target=hotkey_poll_thread, args=(rec,), daemon=True).start()
+    threading.Thread(target=hotkey_poll_thread, args=(asr,), daemon=True).start()
     threading.Thread(target=_overlay_thread, daemon=True).start()
 
     reopen_stream()   # 优先用 settings.json 记住的可用麦克风，失效回退系统默认

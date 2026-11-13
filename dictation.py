@@ -41,7 +41,8 @@ LLAMA_SERVER_EXE = os.path.join(ROOT, "llama-cpp", "llama-server.exe")
 LLAMA_PORT = 8750
 LLAMA_BASE = f"http://127.0.0.1:{LLAMA_PORT}"
 SETTINGS_PATH = os.path.join(ROOT, "settings.json")   # 记住可用人声的麦克风设备
-WHISPER_DIR = os.path.join(ROOT, "models", "whisper-turbo-ct2")   # 主力 ASR（GPU）
+WHISPER_DIR = os.path.join(ROOT, "models", "whisper-turbo-ct2")   # 备用 ASR（GPU，当前未启用）
+QWEN3_DIR = os.path.join(ROOT, "models", "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25")   # 主力 ASR（CPU，原生热词+标点）
 DEFAULT_REPL = {
     "get up": "GitHub",
     "get hub": "GitHub",
@@ -373,15 +374,10 @@ def finish_recording(asr):
             pass
     try:
         t0 = time.time()
-        if asr["engine"] == "whisper":
-            segments, _ = asr["whisper"].transcribe(
-                audio, beam_size=1, temperature=0.0, condition_on_previous_text=False)
-            text = "".join(s.text for s in segments).strip()
-        else:
-            s = asr["sensevoice"].create_stream()
-            s.accept_waveform(SR, audio)
-            asr["sensevoice"].decode_stream(s)
-            text = s.result.text.strip()
+        s = asr["rec"].create_stream()
+        s.accept_waveform(SR, audio)
+        asr["rec"].decode_stream(s)
+        text = s.result.text.strip()
         ms = (time.time() - t0) * 1000
         if not text:
             notify("识别结果为空，未上屏")
@@ -775,21 +771,22 @@ def main():
     )   # 备用引擎（CPU），Whisper 不可用时自动接管
     asr = {"engine": "sensevoice", "sensevoice": rec, "whisper": None}
 
-    if os.path.isdir(WHISPER_DIR):
+    if os.path.isdir(QWEN3_DIR):
         try:
-            _sp = os.path.join(os.path.dirname(sys.executable), "Lib", "site-packages")
-            for _sub in (r"nvidia\cudnn\bin", r"nvidia\cublas\bin", r"nvidia\cuda_runtime\bin"):
-                _p = os.path.join(_sp, _sub)
-                if os.path.isdir(_p):
-                    os.add_dll_directory(_p)
-            from faster_whisper import WhisperModel
-            asr["whisper"] = WhisperModel(WHISPER_DIR, device="cuda", compute_type="float16")
-            asr["engine"] = "whisper"
-            log("ASR 引擎：Whisper large-v3-turbo（GPU 常驻；SenseVoice 自动备用）")
+            rec_q = sherpa_onnx.OfflineRecognizer.from_qwen3_asr(
+                conv_frontend=os.path.join(QWEN3_DIR, "conv_frontend.onnx"),
+                encoder=os.path.join(QWEN3_DIR, "encoder.int8.onnx"),
+                decoder=os.path.join(QWEN3_DIR, "decoder.int8.onnx"),
+                tokenizer=os.path.join(QWEN3_DIR, "tokenizer"),
+                num_threads=4,
+                hotwords="GitHub VSCode OpenAI ChatGPT Claude API Docker Python Mac",
+            )
+            asr = {"engine": "qwen3", "rec": rec_q, "sensevoice": rec}
+            log("ASR 引擎：Qwen3-ASR 0.6B（CPU；原生热词+标点；SenseVoice 自动备用）")
         except Exception as e:
-            log(f"Whisper 引擎加载失败，回退 SenseVoice：{type(e).__name__}: {e}")
+            log(f"Qwen3-ASR 加载失败，回退 SenseVoice：{type(e).__name__}: {e}")
     else:
-        log("未找到 Whisper 模型目录，使用 SenseVoice（CPU）")
+        log("未找到 Qwen3 模型目录，使用 SenseVoice（CPU）")
     log("识别器就绪，托盘常驻中（按住 Ctrl+Space 说话）")
 
     threading.Thread(target=hotkey_poll_thread, args=(asr,), daemon=True).start()

@@ -221,7 +221,7 @@ def polish_text(text):
         log(f"润色出错，回退原文：{type(e).__name__}: {e}")
         return text
 
-state = {"enabled": True, "recording": False, "rec_start": 0.0, "rec_gen": 0, "polish": False}
+state = {"enabled": True, "recording": False, "rec_start": 0.0, "rec_gen": 0, "polish": True}
 frames = []
 levels = deque(maxlen=75)   # 20ms/块 → 1.5s 波形历史
 icon_ref = {}

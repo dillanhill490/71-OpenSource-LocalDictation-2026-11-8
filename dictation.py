@@ -36,6 +36,7 @@ TYPE_INTERVAL_S = 0.003
 MIN_DUR_S = 0.25
 REPL_PATH = os.path.join(ROOT, "replacements.json")   # 专有名词替换表（用户可编辑，每次听写自动重载）
 LLM_PATH = os.path.join(ROOT, "models", "llm", "qwen2.5-3b-instruct-q4_k_m.gguf")  # 本地润色模型
+QWEN3_PATH = os.path.join(ROOT, "models", "llm", "qwen3-4b-instruct-2507-q4_k_m.gguf")  # 升级候选
 LLAMA_SERVER_EXE = os.path.join(ROOT, "llama-cpp", "llama-server.exe")
 LLAMA_PORT = 8750
 LLAMA_BASE = f"http://127.0.0.1:{LLAMA_PORT}"
@@ -100,13 +101,14 @@ def apply_replacements(text):
 
 # ---------------- 本地小模型润色层（Phase 2，llama-server GPU 推理 + HTTP 调用） ----------------
 _llm_proc = {"popen": None}
-POLISH_SYS = ("你是语音输入润色器。把语音识别原文改写为通顺书面文字：只修正错别字、"
-              "专有名词写法、删除口头语（嗯、呃、那个、就是说）、规范标点；"
-              "不得改变意思、不得增删内容、不要回答或评论原文。直接输出改写结果，不要任何解释。")
+POLISH_SYS = ("你是听写文本清理器。严格遵守：逐字保留用户说出的每一个实词，禁止改写句式、"
+              "替换词语、增删任何内容、改变语气人称。只允许三类最小修改："
+              "①删除纯口头语（嗯、呃、那个、就是说）②为断句补标点 ③按对照表修正专有名词写法。"
+              "输出必须是基于原文的最小修改版本，不要任何解释。")
 POLISH_FEWSHOT = [
-    ("帮我打开get up写个爬虫", "帮我打开 GitHub 写个爬虫"),
+    ("润色层我觉得现在做的非常不好", "润色层我觉得现在做得非常不好。"),
     ("那个今天下午三点开会 呃 别迟到", "今天下午三点开会，别迟到。"),
-    ("把这个bug修一下嗯然后重新发布", "把这个 bug 修一下，然后重新发布。"),
+    ("帮我打开get up提交一下代码", "帮我打开 GitHub 提交一下代码。"),
 ]
 
 
@@ -163,8 +165,25 @@ def get_llm():
         return None
 
 
+def cer_norm(a, b):
+    """归一化编辑距离（去标点/空白/大小写后），作"是否面目全非"的机械判据。"""
+    def _n(s):
+        s = re.sub(r"[，。？！、；：,.?!;:\s'\"（）]+", "", s)
+        return s.lower()
+    a, b = _n(a), _n(b)
+    if not a:
+        return 0.0 if b else 1.0
+    dp = list(range(len(b) + 1))
+    for i, ac in enumerate(a, 1):
+        prev, dp[0] = dp[0], i
+        for j, bc in enumerate(b, 1):
+            cur = min(dp[j] + 1, dp[j-1] + 1, prev + (ac != bc))
+            prev, dp[j] = dp[j], cur
+    return dp[-1] / max(len(a), 1)
+
+
 def polish_text(text):
-    if not state.get("polish", True) or len(text) < 2:
+    if not state.get("polish", False) or len(text) < 2:
         return text
     llm = get_llm()
     if not llm:
@@ -191,13 +210,18 @@ def polish_text(text):
         if not fixed or len(fixed) > len(text) * 3 + 20:
             log(f"润色输出异常，回退原文（{ms:.0f}ms）：{fixed!r}")
             return text
+        # 意思不变守卫：润色结果与原文差异过大（改写过度/删词）→ 判定面目全非，回退原文
+        _d = cer_norm(text, fixed)
+        if _d > 0.35:
+            log(f"润色被守卫拦截（与原文差异 {_d:.0%} > 35%），回退原文（{ms:.0f}ms）：{fixed!r}")
+            return text
         log(f"润色 {ms:.0f}ms：{text!r} → {fixed!r}")
         return fixed
     except Exception as e:
         log(f"润色出错，回退原文：{type(e).__name__}: {e}")
         return text
 
-state = {"enabled": True, "recording": False, "rec_start": 0.0, "rec_gen": 0, "polish": True}
+state = {"enabled": True, "recording": False, "rec_start": 0.0, "rec_gen": 0, "polish": False}
 frames = []
 levels = deque(maxlen=75)   # 20ms/块 → 1.5s 波形历史
 icon_ref = {}
@@ -780,13 +804,13 @@ def main():
         notify("已恢复 Ctrl+Space 听写" if state["enabled"] else "已暂停：Ctrl+Space 恢复自由")
 
     def toggle_polish(icon, item):
-        state["polish"] = not state.get("polish", True)
+        state["polish"] = not state.get("polish", False)
         notify(f"润色层：{'开（本地小模型纠错润色）' if state['polish'] else '关（原文直出）'}")
 
     menu = Menu(
         MenuItem(lambda item: "暂停听写（释放 Ctrl+Space）" if state["enabled"]
                  else "恢复听写", toggle),
-        MenuItem(lambda item: "润色后上屏：开" if state.get("polish", True)
+        MenuItem(lambda item: "润色后上屏：开" if state.get("polish", False)
                  else "润色后上屏：关", toggle_polish),
         MenuItem("退出", lambda icon: icon.stop()),
     )

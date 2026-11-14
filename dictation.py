@@ -766,10 +766,19 @@ def main():
 
     log("启动：加载识别器……")
     load_replacements()   # 启动即生成/校验替换表文件，方便用户直接编辑
-    rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-        model=MODEL, tokens=TOKENS, use_itn=True, num_threads=4, language="auto",
-    )   # 备用引擎（CPU），Whisper 不可用时自动接管
-    asr = {"engine": "sensevoice", "sensevoice": rec, "whisper": None}
+    # 备用引擎 SenseVoice：模型不存在则跳过（用户已删除备用模型，仅主力运行）
+    rec = None
+    if os.path.exists(MODEL) and os.path.exists(TOKENS):
+        try:
+            rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+                model=MODEL, tokens=TOKENS, use_itn=True, num_threads=4, language="auto",
+            )
+            log("备用引擎 SenseVoice 已加载")
+        except Exception as e:
+            log(f"备用引擎加载失败（忽略）：{type(e).__name__}: {e}")
+    else:
+        log("备用模型未安装，仅主力引擎运行")
+    asr = {"engine": "sensevoice" if rec else None, "rec": rec, "sensevoice": rec}
 
     if os.path.isdir(QWEN3_DIR):
         try:
@@ -782,11 +791,20 @@ def main():
                 hotwords="GitHub VSCode OpenAI ChatGPT Claude API Docker Python Mac",
             )
             asr = {"engine": "qwen3", "rec": rec_q, "sensevoice": rec}
-            log("ASR 引擎：Qwen3-ASR 0.6B（CPU；原生热词+标点；SenseVoice 自动备用）")
+            log("ASR 引擎：Qwen3-ASR 0.6B（CPU；原生热词+标点；"
+                + ("SenseVoice 自动备用）" if rec else "无备用引擎）"))
         except Exception as e:
-            log(f"Qwen3-ASR 加载失败，回退 SenseVoice：{type(e).__name__}: {e}")
+            if rec:
+                log(f"Qwen3-ASR 加载失败，回退 SenseVoice：{type(e).__name__}: {e}")
+            else:
+                log(f"Qwen3-ASR 加载失败且无备用引擎，退出：{type(e).__name__}: {e}")
+                raise
     else:
-        log("未找到 Qwen3 模型目录，使用 SenseVoice（CPU）")
+        if rec:
+            log("未找到 Qwen3 模型目录，使用 SenseVoice（CPU）")
+        else:
+            log("未找到任何识别模型，退出")
+            raise SystemExit(1)
     log("识别器就绪，托盘常驻中（按住 Ctrl+Space 说话）")
 
     threading.Thread(target=hotkey_poll_thread, args=(asr,), daemon=True).start()

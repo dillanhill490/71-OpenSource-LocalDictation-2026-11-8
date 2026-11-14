@@ -36,8 +36,9 @@ everything on your machine.
   physical key polling — no missed presses, IME-safe)
 - **Wispr-style waveform pill**: tiny rounded overlay above the taskbar of the
   monitor you're working on; follows you across displays; never steals focus
-- **Chinese-first accuracy**: SenseVoice Small, benchmarked at **0.75% CER overall
-  (0% on plain Chinese / numbers / long sentences)** across 36 test utterances
+- **Chinese-first accuracy**: primary engine Qwen3-ASR 0.6B — picked from a
+  **six-engine benchmark** at **0.65% CER overall, 0% errors on Chinese-English
+  mixed speech** (36 test utterances); SenseVoice ships as automatic fallback
 - **Editable hotword table** (`replacements.json`): fix your own mis-recognized
   jargon ("get up" → `GitHub`), hot-reloaded after every utterance
 - Tray icon with pause/exit; optional start-up shortcut
@@ -49,7 +50,7 @@ everything on your machine.
 git clone https://github.com/dillanhill490/71-OpenSource-LocalDictation-2026-11-8.git
 cd 71-OpenSource-LocalDictation-2026-11-8
 pip install -r requirements.txt
-python download_model.py      :: ~155 MB download, one time
+python download_model.py      :: ~950 MB downloads (primary + fallback), one time
 python dictation.py
 ```
 
@@ -65,9 +66,11 @@ folder (`Win+R` → `shell:startup`).
 
 ## How it works
 
-- ASR: [SenseVoice Small](https://github.com/FunAudioLLM/SenseVoice) int8 ONNX via
-  [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) — non-autoregressive CTC,
-  ~100 ms decode for a 10 s utterance on a laptop CPU (i9-13900HX; no GPU needed)
+- ASR: primary [Qwen3-ASR 0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) int8 ONNX
+  (LLM-decoder architecture: fresh 2026 vocabulary, native punctuation & hotwords,
+  ~0.6 s/utt on laptop CPU) via [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx);
+  [SenseVoice Small](https://github.com/FunAudioLLM/SenseVoice) int8 as automatic
+  fallback (~100 ms/utt)
 - Hotkey: 15 ms polling of physical key state (`GetAsyncKeyState`) — press order,
   dropped events and IME interference can't miss a trigger
 - Typing: `SendInput` unicode injection into the current focus
@@ -86,12 +89,15 @@ folder (`Win+R` → `shell:startup`).
 
 ## Credits & licenses
 
-- **SenseVoice Small** model © Alibaba FunAudioLLM — model weights under the
+- **Qwen3-ASR 0.6B** (primary ASR) © Alibaba Qwen team — **Apache-2.0**. Not
+  redistributed here; `download_model.py` fetches the official build.
+- **SenseVoice Small** (fallback ASR) © Alibaba FunAudioLLM — model weights under the
   [FunASR Model Open Source License](https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE);
   source code MIT. Not redistributed here; `download_model.py` fetches the
   official build.
 - **sherpa-onnx** — Apache-2.0.
-- This project — [MIT](LICENSE).
+- This project's own code — [MIT](LICENSE). (Model weights keep their own
+  licenses above; the MIT grant covers this repository's code only.)
 
 This project is not affiliated with Alibaba, k2-fsa, or Wispr (Flow).
 
@@ -104,10 +110,10 @@ tech terms / long sentences × 2 voices), 3 runs each, median:
 |---|---|
 | Plain Chinese | 0% |
 | Numbers & dates | 0% |
+| Chinese-English mixed | 0% |
 | Long sentences | 0% |
-| Chinese-English mixed | 1.51% |
-| Tech terms | 2.94% |
-| **Overall** | **0.75%** |
+| Tech terms | 5.88% |
+| **Overall** | **0.65%** |
 
 (The few errors come from TTS mispronouncing English words in the test set —
 real speech fares better; see `replacements.json` for the ergonomic fix.)
